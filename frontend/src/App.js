@@ -1,9 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { MapContainer, TileLayer, ImageOverlay } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import "./App.css";
 
 function App() {
+  const [metadata, setMetadata] = useState(null);
   const [radarUrl, setRadarUrl] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [bounds, setBounds] = useState([
@@ -13,26 +14,26 @@ function App() {
 
   const BACKEND = process.env.REACT_APP_BACKEND || "http://127.0.0.1:8000";
 
-  const fetchMetadata = async () => {
-    try {
-      const res = await fetch(`${BACKEND}/api/radar/metadata/`);
-      const data = await res.json();
-      setRadarUrl(data.image_url);
-      setLastUpdated(data.last_updated);
-      setBounds([
-        [data.bounds[0], data.bounds[1]],
-        [data.bounds[2], data.bounds[3]],
-      ]);
-    } catch (err) {
-      console.error("Error fetching radar metadata:", err);
-    }
-  };
+  const fetchMetadata = useCallback(async () => {
+  try {
+    const res = await fetch(`${BACKEND}/api/radar/metadata/`);
+    const data = await res.json();
+    setRadarUrl(data.image_url);
+    setLastUpdated(data.last_updated);
+    setBounds([
+      [data.bounds[0], data.bounds[1]],
+      [data.bounds[2], data.bounds[3]],
+    ]);
+  } catch (err) {
+    console.error("Error fetching radar metadata:", err);
+  }
+}, [BACKEND]);
 
   useEffect(() => {
-    fetchMetadata();
-    const interval = setInterval(fetchMetadata, 5 * 60 * 1000); 
-    return () => clearInterval(interval);
-  }, []);
+  fetchMetadata();
+  const interval = setInterval(fetchMetadata, 5 * 60 * 1000); 
+  return () => clearInterval(interval);
+}, [fetchMetadata]);
 
   return (
     <div className="app-container">
