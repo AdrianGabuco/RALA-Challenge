@@ -6,50 +6,74 @@ from PIL import Image
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_GET
 from .utils import find_latest_grib_url
+import eccodes 
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 DEFAULT_BOUNDS = [20.0, -130.0, 55.0, -60.0]
 
-# --- NEW MEMORY OPTIMIZATION FUNCTION ---
-def _downsample_data(data_array, factor=4):
+
+def _downsample_data(data_array, factor=8): 
     """
-    Downsamples the xarray DataArray using block averaging.
-    This is essential to reduce memory usage from large GRIB grids.
-    A factor of 4 reduces the data size by 16x.
+    Downsamples the NumPy data array using block averaging.
+    A factor of 8 reduces the data size by 64x.
     """
     if data_array.ndim != 2:
-        # If not 2D, return as is or handle reshaping before calling this function
-        # (your existing code handles flattening later, but we prefer 2D here)
-        return data_array
+        if data_array.ndim > 2:
+             print(f"⚠️ Flattening {data_array.ndim}D array -> 2D")
+             data_array = data_array.reshape(data_array.shape[-2], data_array.shape[-1])
+        else:
+             print(f"⚠️ Unexpected data array dimension: {data_array.ndim}. Returning as is.")
+             return data_array
 
-    # 1. Access the underlying Dask array (lazy operation, no huge memory load yet)
-    data = data_array.data
+  
+    ny, nx = data_array.shape
 
-    # 2. Reshape and mean calculation (still often lazy)
-    # Get original dimensions
-    ny, nx = data.shape
 
-    # Calculate new dimensions for downsampling
     ny_new = ny // factor
     nx_new = nx // factor
 
-    # Truncate data to be perfectly divisible by factor
-    data_truncated = data[:ny_new * factor, :nx_new * factor]
 
-    # Reshape for block averaging: (ny_new, factor, nx_new, factor)
-    # Then take the mean over the two 'factor' axes (axes 1 and 3)
+    data_truncated = data_array[:ny_new * factor, :nx_new * factor]
+
+
     downsampled_array = data_truncated.reshape(
         ny_new, factor, nx_new, factor
     ).mean(axis=(1, 3))
 
-    # 3. FORCE the calculation to a NumPy array to load the *smaller* result
-    # into memory. This is where memory is actually used.
     print(f"📉 Downsampling from ({ny}, {nx}) to ({ny_new}, {nx_new}) (Factor: {factor})")
-    return np.array(downsampled_array, dtype=float)
+    return downsampled_array 
 
-# --- END NEW FUNCTION ---
+
+def _get_grib_data_low_memory(filepath):
+
+    fhandle = None
+    try:
+        fhandle = eccodes.codes_open_file(filepath, 'r')
+        message = eccodes.codes_grib_find_next(fhandle)
+        if message is None:
+            raise ValueError("No GRIB messages found in file.")
+
+
+        values = eccodes.codes_get_values(message)
+        eccodes.codes_release(message)
+        
+
+        Ni = eccodes.codes_get(message, 'Ni')
+        Nj = eccodes.codes_get(message, 'Nj')
+        
+        if Ni * Nj != values.size:
+             raise ValueError(f"Dimensions Ni*Nj ({Ni*Nj}) do not match value size ({values.size})")
+        
+        data = values.reshape((Nj, Ni))
+        return data
+
+    finally:
+        if fhandle:
+            eccodes.codes_close_file(fhandle)
+    
+
 
 def _reflectivity_to_rgba(data):
 
@@ -87,31 +111,6 @@ def _reflectivity_to_rgba(data):
     return rgba
 
 
-def _open_grib_with_fallback(filepath):
-    filters = [
-        {"shortName": "REFL"},
-        {"shortName": "DZ"},
-        {"shortName": "RALA"},
-        {"typeOfLevel": "surface"},
-        {}
-    ]
-
-    for f in filters:
-        try:
-            # We are NOT forcing ds.load() here. Keep it lazy.
-            ds = xr.open_dataset(
-                filepath,
-                engine="cfgrib",
-                backend_kwargs={"filter_by_keys": f, "indexpath": ""}
-            )
-            print(f"✅ Opened with filter: {f}")
-            if len(ds.data_vars) > 0:
-                return ds
-        except Exception as e:
-            print(f"❌ Failed filter {f}: {e}")
-    return None
-
-
 @require_GET
 def metadata(request):
     meta_file = os.path.join(CACHE_DIR, "latest_meta.txt")
@@ -125,9 +124,8 @@ def metadata(request):
 
 @require_GET
 def latest_png(request):
-    # Ensure all file variables are defined at the start for cleanup
+
     tmp_file_path = None
-    ds = None
     
     try:
         grib_url = find_latest_grib_url()
@@ -140,48 +138,41 @@ def latest_png(request):
         cache_meta = os.path.join(CACHE_DIR, "latest_meta.txt")
 
 
+
         if not os.path.exists(cache_gz):
-            r = requests.get(grib_url, timeout=30)
+            print(f"⬇️ Downloading GRIB file: {grib_url}")
+            r = requests.get(grib_url, stream=True, timeout=30)
             r.raise_for_status()
             with open(cache_gz, "wb") as f:
-                f.write(r.content)
 
-        with gzip.open(cache_gz, "rb") as gz:
-            grib_bytes = gz.read()
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".grib2")
-        tmp.write(grib_bytes)
-        tmp.close()
-        tmp_file_path = tmp.name # Save temp file path for cleanup
+        tmp_file_path = tmp.name
+        tmp.close() 
+        print("🗜️ Decompressing GRIB file to temporary file.")
+        with gzip.open(cache_gz, "rb") as gz_in:
+             with open(tmp_file_path, "wb") as f_out:
 
-        ds = _open_grib_with_fallback(tmp_file_path)
-        if ds is None:
-            raise ValueError("Failed to open GRIB file with any filter.")
+                 while True:
+                     chunk = gz_in.read(8192)
+                     if not chunk:
+                         break
+                     f_out.write(chunk)
 
-        print("✅ Successfully opened GRIB file")
+
+        data_raw = _get_grib_data_low_memory(tmp_file_path)
         
-        vars_list = list(ds.data_vars.keys())
-
-        if not vars_list:
-            raise ValueError(f"No data variables found. Dataset summary: {ds}")
-
-        var_name = vars_list[0]
-        print(f"✅ Using variable: {var_name}")
-
-        # --- MEMORY OPTIMIZATION IMPLEMENTATION ---
+        if data_raw is None or data_raw.size == 0:
+            raise ValueError("Failed to extract raw data using eccodes.")
         
-        # 1. Get the DataArray (still likely a Dask array, thus lazy)
-        da = ds[var_name]
+        print("✅ Successfully extracted raw GRIB data")
+        
 
-        # 2. Downsample the data array *before* forcing it into NumPy memory
-        # If the original data is (3500, 7000) (24.5 million points):
-        # Downsampling by factor=4 reduces it to (875, 1750) (1.5 million points), a 16x reduction.
-        # This will fit within the 512MB limit.
-        data = _downsample_data(da, factor=4)
+        data = _downsample_data(data_raw, factor=8) 
         
-        # NOTE: If memory errors persist, increase factor to 8 (64x reduction) or more.
-        
-        # --- END MEMORY OPTIMIZATION ---
+
 
         print(f"✅ Final data shape: {data.shape}, min={np.nanmin(data):.2f}, max={np.nanmax(data):.2f}")
 
@@ -189,9 +180,9 @@ def latest_png(request):
         rgba = _reflectivity_to_rgba(data)
         Image.fromarray(rgba, "RGBA").save(cache_png)
         
-        # IMPORTANT: Close the dataset immediately after processing to release memory/file handles
-        ds.close()
-        os.unlink(tmp_file_path) # Delete the temporary file
+
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path) 
 
         with open(cache_meta, "w") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
@@ -201,19 +192,14 @@ def latest_png(request):
     except Exception as e:
         print("❌ ERROR:", e)
         
-        # Cleanup routine
-        if ds is not None:
-             try:
-                 ds.close()
-             except Exception:
-                 pass
+
         if tmp_file_path and os.path.exists(tmp_file_path):
             try:
                 os.unlink(tmp_file_path)
             except Exception:
                 pass
         
-        # Existing fallback to cached PNG
+
         if os.path.exists(cache_png):
             return HttpResponse(open(cache_png, "rb").read(), content_type="image/png")
         return HttpResponse(f"Error: {e}", status=500)
