@@ -12,7 +12,7 @@ function App() {
     [55.0, -60.0],
   ]);
 
-  const BACKEND = process.env.REACT_APP_BACKEND || "http://127.0.0.1:8000";
+  const BACKEND = process.env.REACT_APP_BACKEND || "https://rala-challenge.onrender.com";
 
   const fetchMetadata = useCallback(async () => {
   try {
